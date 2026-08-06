@@ -11,13 +11,14 @@ import json
 import logging
 from typing import Optional
 
+import certifi
 import httpx
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-PRIMARY_TIMEOUT = 3.0  # seconds
+PRIMARY_TIMEOUT = 10.0  # seconds (first request may have cold start)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -31,7 +32,7 @@ async def _call_openai_compatible(
     model: str,
     timeout: float = 30.0,
     max_tokens: int = 2048,
-    temperature: float = 0.7,
+    temperature: float = 1.0,  # DeepSeek 推荐 temperature=1.0
 ) -> str:
     """Call any OpenAI-compatible chat completions endpoint."""
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -44,9 +45,10 @@ async def _call_openai_compatible(
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "thinking": {"type": "disabled"},  # 面试不需要 thinking，节省 token
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=certifi.where()) as client:
         resp = await client.post(url, headers=headers, json=body)
         resp.raise_for_status()
         data = resp.json()
