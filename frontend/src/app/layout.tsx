@@ -4,7 +4,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ToastContainer } from "@/components/Toast";
 
 export const metadata: Metadata = {
-  title: "AI 模���面试",
+  title: "AI 模拟面试",
   description: "AI 驱动的模拟面试练习平台",
 };
 

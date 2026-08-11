@@ -1,7 +1,7 @@
 """LLM service — DeepSeek (primary) + Qwen (fallback) with timeout & retry.
 
 Uses httpx directly (no LangChain dependency) for OpenAI-compatible chat API.
-Fallback chain: DeepSeek ─3s timeout→ Qwen ─error→ Mock echo
+Fallback chain: DeepSeek ─timeout→ Qwen ─error→ Mock echo
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-PRIMARY_TIMEOUT = 10.0  # seconds (first request may have cold start)
+PRIMARY_TIMEOUT = 10.0      # seconds for normal requests
+BATCH_TIMEOUT = 45.0        # seconds for batch operations (e.g. personalise all questions)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -63,11 +64,17 @@ async def llm_invoke(
     prompt: str,
     system_prompt: str = "",
     use_fallback: bool = False,
+    timeout: Optional[float] = None,
 ) -> str:
     """Invoke LLM with automatic fallback.
 
-    Chain: DeepSeek (3s) → Qwen → Mock echo
+    Chain: DeepSeek (timeout) → Qwen → Mock echo
+
+    Args:
+        timeout: Override the primary timeout (seconds). None = use PRIMARY_TIMEOUT.
     """
+    effective_timeout = timeout if timeout is not None else PRIMARY_TIMEOUT
+
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -82,12 +89,12 @@ async def llm_invoke(
                     base_url=settings.deepseek_base_url,
                     api_key=settings.deepseek_api_key,
                     model=settings.deepseek_model,
-                    timeout=PRIMARY_TIMEOUT,
+                    timeout=effective_timeout,
                 ),
-                timeout=PRIMARY_TIMEOUT + 1,
+                timeout=effective_timeout + 3,
             )
         except (asyncio.TimeoutError, Exception) as e:
-            logger.warning("DeepSeek failed (%.1fs): %s", PRIMARY_TIMEOUT, e)
+            logger.warning("DeepSeek failed (%.1fs): %s", effective_timeout, e)
 
     # ── Try fallback (Qwen) ────────────────────────────
     if settings.qwen_api_key and not (use_fallback and not settings.qwen_api_key):

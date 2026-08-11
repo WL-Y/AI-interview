@@ -5,7 +5,8 @@ Supports two modes:
   - Voice mode: WebSocket + audio endpoints for real voice interviews
 """
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from datetime import datetime
 
 from app.agent.prep.agent import PrepAgent
 from app.agent.live.agent import LiveAgent
@@ -19,6 +20,7 @@ from app.models.interview import (
 )
 from app.services.livekit.worker import VoiceInterviewWorker
 from app.services.resume_parser import parse_resume
+from app.services.voice.audio_utils import pcm_to_wav
 
 router = APIRouter()
 
@@ -61,21 +63,50 @@ def _cleanup_expired_sessions():
 
 @router.post("/create", response_model=InterviewContext)
 async def create_interview(
-    position: str = "前端工程师",
+    position: str = Form(""),
     resume: UploadFile | None = File(None),
 ):
-    """Create a new interview session. Optionally upload a resume (PDF/DOCX/TXT)."""
+    """Create a new interview session. Upload a resume (PDF/DOCX/TXT) for personalised questions.
+
+    position is optional — when a resume is provided, the LLM infers the target role.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
     resume_text: str | None = None
+    resume_data: dict | None = None  # Structured resume output (v2)
 
     if resume and resume.filename:
         content = await resume.read()
+        _log.info(f"Received resume: filename={resume.filename!r}, size={len(content)} bytes, content_type={resume.content_type!r}")
         try:
-            resume_text = await parse_resume(content, resume.filename)
+            resume_data = await parse_resume(content, resume.filename)
+            resume_text = resume_data["text"]
+            _log.info(
+                f"Parsed resume: {resume_data['metadata']['char_count']} chars, "
+                f"{resume_data['metadata']['paragraph_count']} paragraphs, "
+                f"{resume_data['metadata']['table_count']} tables, "
+                f"{len(resume_data['blocks'])} blocks (ordered), "
+                f"quality={'OK' if not resume_data['quality']['suspicious'] else 'SUSPICIOUS: ' + str(resume_data['quality']['issues'])}"
+            )
+            if resume_data["text_truncated"]:
+                _log.warning(f"Resume text truncated from {resume_data['metadata']['char_count']} to {len(resume_text)} chars")
         except ValueError as e:
-            raise HTTPException(400, str(e))
+            _log.warning(f"Resume parse ValueError: {e}")
+            raise HTTPException(400, f"简历解析失败: {e}")
         except ImportError as e:
-            raise HTTPException(500, str(e))
+            _log.error(f"Resume parse ImportError: {e}")
+            raise HTTPException(500, f"缺少依赖: {e}")
+        except Exception as e:
+            _log.error(f"Resume parse unexpected error: {type(e).__name__}: {e}")
+            raise HTTPException(400, f"简历解析异常: {e}")
+    else:
+        _log.warning(f"No resume received: resume={resume is not None}, filename={resume.filename if resume else 'N/A'}")
 
+    if not resume_text:
+        raise HTTPException(400, "请上传简历文件（PDF/DOCX/TXT），AI 将根据你的背景生成个性化面试")
+
+    position = position or ""  # Empty string if not provided
     ctx = await _prep_agent.run(position=position, resume_text=resume_text)
     _sessions[ctx.session_id] = ctx
     return ctx
@@ -91,15 +122,25 @@ async def get_interview(session_id: str) -> InterviewContext:
 
 @router.post("/{session_id}/start", response_model=InterviewContext)
 async def start_interview(session_id: str) -> InterviewContext:
-    """Transition to Live and return the first interviewer message."""
+    """Transition to Live and return the first interviewer message.
+
+    In adaptive mode, the first question is a personalised opening
+    generated from the candidate's resume/profile.
+    """
     if session_id not in _sessions:
         raise HTTPException(404, "Session not found")
 
     ctx = _sessions[session_id]
 
-    # Run Live agent's on_start
+    # Run Live agent's on_start (now initializes adaptive state)
     first_turn = await _live_agent.on_start(ctx)
     ctx.transcript.append(first_turn)
+
+    # In adaptive mode, total_questions is estimated (not fixed)
+    if ctx.adaptive_mode and ctx.adaptive_state:
+        # Estimate based on skills × avg questions per skill
+        estimated = len(ctx.adaptive_state.skills) * 3
+        ctx.total_questions = estimated
 
     return ctx
 
@@ -133,6 +174,81 @@ async def send_message(session_id: str, content: str) -> InterviewContext:
     return ctx
 
 
+@router.post("/{session_id}/pause")
+async def pause_interview(session_id: str):
+    """Pause the interview. State is preserved for later resume."""
+    if session_id not in _sessions:
+        raise HTTPException(404, "Session not found")
+
+    ctx = _sessions[session_id]
+    try:
+        _live_agent.pause(ctx)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return {"status": "paused", "elapsed_seconds": ctx.elapsed_seconds}
+
+
+@router.post("/{session_id}/resume", response_model=InterviewContext)
+async def resume_interview(session_id: str) -> InterviewContext:
+    """Resume a paused interview. Returns the context with a system resume message."""
+    if session_id not in _sessions:
+        raise HTTPException(404, "Session not found")
+
+    ctx = _sessions[session_id]
+    try:
+        resume_turn = _live_agent.resume(ctx)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    ctx.transcript.append(resume_turn)
+    return ctx
+
+
+@router.get("/{session_id}/progress")
+async def get_progress(session_id: str):
+    """Get interview progress: phase, questions done/remaining, elapsed time, skills."""
+    if session_id not in _sessions:
+        raise HTTPException(404, "Session not found")
+
+    ctx = _sessions[session_id]
+    return _live_agent.get_progress(ctx)
+
+
+@router.get("/{session_id}/skills")
+async def get_skills(session_id: str):
+    """Get adaptive skill estimates — score, confidence, and coverage for each skill."""
+    if session_id not in _sessions:
+        raise HTTPException(404, "Session not found")
+
+    ctx = _sessions[session_id]
+    if not ctx.adaptive_state:
+        return {"skills": {}, "coverage_pct": 0, "current_topic": ""}
+
+    skills_data = {}
+    for name, skill in ctx.adaptive_state.skills.items():
+        skills_data[name] = {
+            "score": skill.score,
+            "confidence": round(skill.confidence, 2),
+            "evidence_count": skill.evidence_count,
+            "importance": skill.importance,
+            "coverage": round(ctx.adaptive_state.coverage.get(name, 0.0), 2),
+        }
+
+    total_cov = sum(ctx.adaptive_state.coverage.values())
+    skill_count = len(ctx.adaptive_state.coverage)
+    coverage_pct = round((total_cov / skill_count) * 100) if skill_count > 0 else 0
+
+    return {
+        "skills": skills_data,
+        "coverage_pct": coverage_pct,
+        "current_topic": ctx.adaptive_state.current_topic,
+        "current_difficulty": ctx.adaptive_state.current_difficulty,
+        "turns_on_topic": ctx.adaptive_state.turns_on_topic,
+        "phase": ctx.current_phase.value,
+    }
+
+
 @router.post("/{session_id}/finish", response_model=InterviewContext)
 async def finish_interview(session_id: str) -> InterviewContext:
     """End the interview → run Post scoring agent."""
@@ -143,7 +259,7 @@ async def finish_interview(session_id: str) -> InterviewContext:
 
     # Run Post agent
     ctx = await _post_agent.run(ctx)
-    ctx.completed_at = ctx.completed_at or ctx.created_at
+    ctx.completed_at = datetime.now()  # B3 fix: use actual completion time
 
     return ctx
 
@@ -166,9 +282,11 @@ async def voice_start(session_id: str):
 
     audio = await worker.start()
     import base64
+    # B5 fix: wrap PCM in WAV header for browser playback
+    wav_audio = pcm_to_wav(audio) if audio else b""
     return {
         "session_id": session_id,
-        "audio_base64": base64.b64encode(audio).decode("utf-8") if audio else "",
+        "audio_base64": base64.b64encode(wav_audio).decode("utf-8") if wav_audio else "",
         "text": ctx.transcript[-1].content if ctx.transcript else "",
         "phase": ctx.current_phase.value,
     }
@@ -191,9 +309,11 @@ async def voice_send(session_id: str, text: str):
     audio = await worker.tts.synthesise(reply_text)
 
     import base64
+    # B5 fix: wrap PCM in WAV header
+    wav_audio = pcm_to_wav(audio) if audio else b""
     return {
         "text": reply_text,
-        "audio_base64": base64.b64encode(audio).decode("utf-8") if audio else "",
+        "audio_base64": base64.b64encode(wav_audio).decode("utf-8") if wav_audio else "",
         "phase": _sessions[session_id].current_phase.value,
         "is_done": worker.is_done(),
     }
@@ -220,10 +340,12 @@ async def voice_websocket(ws: WebSocket, session_id: str):
     # Send opening message
     opening_audio = await worker.start()
     import base64
+    # B5 fix: wrap PCM in WAV header
+    opening_wav = pcm_to_wav(opening_audio) if opening_audio else b""
     await ws.send_json({
         "type": "interviewer",
         "text": ctx.transcript[-1].content if ctx.transcript else "",
-        "audio_base64": base64.b64encode(opening_audio).decode("utf-8") if opening_audio else "",
+        "audio_base64": base64.b64encode(opening_wav).decode("utf-8") if opening_wav else "",
         "phase": ctx.current_phase.value,
         "is_done": False,
     })
@@ -237,10 +359,12 @@ async def voice_websocket(ws: WebSocket, session_id: str):
                 audio_data = data["bytes"]
                 response_audio = await worker.handle_audio(audio_data)
 
+                # B5 fix: wrap PCM in WAV header
+                response_wav = pcm_to_wav(response_audio) if response_audio else b""
                 await ws.send_json({
                     "type": "interviewer",
                     "text": ctx.transcript[-1].content if ctx.transcript else "",
-                    "audio_base64": base64.b64encode(response_audio).decode("utf-8") if response_audio else "",
+                    "audio_base64": base64.b64encode(response_wav).decode("utf-8") if response_wav else "",
                     "phase": ctx.current_phase.value,
                     "is_done": worker.is_done(),
                 })

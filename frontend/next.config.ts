@@ -10,6 +10,10 @@ const nextConfig: NextConfig = {
       },
     ];
   },
+  // Allow long-running API calls (LLM generation can take 30-60s)
+  experimental: {
+    proxyTimeout: 120_000, // 2 minutes for LLM batch operations
+  },
 };
 
 export default nextConfig;

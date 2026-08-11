@@ -22,7 +22,7 @@ import asyncio
 import logging
 
 from app.agent.live.agent import LiveAgent
-from app.models.interview import InterviewContext, RoleEnum, Turn
+from app.models.interview import InterviewContext, InterviewStatus, RoleEnum, Turn
 from app.services.voice.factory import create_stt, create_tts
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,10 @@ class VoiceInterviewWorker:
         reply_turn = await self.live_agent.on_candidate_message(self.ctx, text)
         self.ctx.transcript.append(reply_turn)
 
+        # B4 fix: detect interview end and set status
+        if _is_closing_message(reply_turn.content):
+            self.ctx.status = InterviewStatus.POST
+
         # 3. Reply text → Audio
         audio = await self.tts.synthesise(reply_turn.content)
         return audio
@@ -92,8 +96,23 @@ class VoiceInterviewWorker:
         ))
         reply_turn = await self.live_agent.on_candidate_message(self.ctx, text)
         self.ctx.transcript.append(reply_turn)
+
+        # B4 fix: detect interview end
+        if _is_closing_message(reply_turn.content):
+            self.ctx.status = InterviewStatus.POST
+
         return reply_turn.content
 
     def is_done(self) -> bool:
         """Check if the interview has completed."""
-        return self.ctx.status == "post"
+        return self.ctx.status == InterviewStatus.POST
+
+
+def _is_closing_message(content: str) -> bool:
+    """Detect interview closing message without fragile string matching."""
+    closing_phrases = [
+        "面试到这里就结束了",
+        "感谢你的时间",
+        "<<END_INTERVIEW>>",
+    ]
+    return any(phrase in content for phrase in closing_phrases)

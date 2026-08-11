@@ -10,7 +10,7 @@ export type Phase =
   | "tech_foundation"
   | "q_and_a";
 
-export type InterviewStatus = "prep" | "live" | "post" | "aborted";
+export type InterviewStatus = "prep" | "live" | "paused" | "post" | "aborted";
 
 export type CompetencyDimension =
   | "tech_depth"
@@ -39,6 +39,41 @@ export interface ScoreCard {
   improvement_plan: string;
 }
 
+export interface SkillEstimate {
+  score: number;
+  confidence: number;
+  evidence_count: number;
+  importance?: number;
+  coverage?: number;
+}
+
+export interface ProgressData {
+  current_phase: string;
+  current_question_index: number;
+  total_questions: number;
+  answered_questions: number;
+  elapsed_seconds: number;
+  status: string;
+  phase_order: string[];
+  current_phase_label: string;
+  coverage_pct: number;
+  adaptive_mode: boolean;
+  skills: Record<string, SkillEstimate>;
+  current_topic: string;
+  latest_draft_score: number | null;
+  latest_feedback: string;
+}
+
+export interface AnswerRecord {
+  question_id: string;
+  question_text: string;
+  answer_summary: string;
+  dimension: CompetencyDimension;
+  draft_score: number | null;
+  notes: string;
+  candidate_answer: string;
+}
+
 export interface InterviewContext {
   session_id: string;
   status: InterviewStatus;
@@ -47,6 +82,11 @@ export interface InterviewContext {
   current_phase: Phase;
   transcript: Turn[];
   scorecard: ScoreCard | null;
+  // Progress fields (new)
+  total_questions: number;
+  answered_questions: number;
+  elapsed_seconds: number;
+  answer_records: AnswerRecord[];
 }
 
 // ── UI-only state ─────────────────────────────────────────
@@ -80,15 +120,30 @@ interface InterviewStore {
   resumeFile: File | null;
   setResumeFile: (f: File | null) => void;
 
+  // Progress (polled)
+  progress: ProgressData | null;
+
+  // Last per-question feedback (shown in UI after each answer)
+  lastDraftScore: number | null;
+  lastFeedback: string;
+  showFeedback: boolean;
+
   // Actions
-  createSession: (position: string, resume?: File) => Promise<void>;
+  createSession: (resume?: File) => Promise<void>;
   startInterview: () => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
   sendVoice: (sessionId: string, text: string) => Promise<{ text: string; audioBase64: string }>;
+  pauseInterview: () => Promise<void>;
+  resumeInterview: () => Promise<void>;
+  fetchProgress: () => Promise<void>;
+  dismissFeedback: () => void;
   finishInterview: () => Promise<void>;
 }
 
-const API_BASE = "/api/interview";
+// Direct backend during dev; through Next.js proxy in production
+const API_BASE = typeof window !== "undefined" && window.location.hostname === "localhost"
+  ? "http://localhost:8000/api/interview"
+  : "/api/interview";
 
 // ── API helper ───────────────────────────────────────────
 
@@ -99,7 +154,7 @@ async function apiCall<T>(
   const res = await fetch(url, options);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error((body as any).message || `请求失败 (${res.status})`);
+    throw new Error((body as any).detail || (body as any).message || `请求失败 (${res.status})`);
   }
   return res.json();
 }
@@ -129,20 +184,30 @@ export const useInterviewStore = create<InterviewStore>((set, get) => ({
   resumeFile: null,
   setResumeFile: (resumeFile) => set({ resumeFile }),
 
+  // Progress
+  progress: null,
+
+  // Per-question feedback
+  lastDraftScore: null,
+  lastFeedback: "",
+  showFeedback: false,
+
   // ── API calls ──────────────────────────────────────────
 
-  createSession: async (position, resume) => {
+  createSession: async (resume) => {
     set({ isLoading: true });
     try {
       const formData = new FormData();
-      formData.append("position", position);
       if (resume) formData.append("resume", resume);
+      console.log("[createSession] Sending request with resume:", resume?.name, resume?.size);
       const session = await apiCall<any>(`${API_BASE}/create`, {
         method: "POST",
         body: formData,
       });
+      console.log("[createSession] Got session:", session.session_id, "questions:", session.total_questions);
       set({ session, isLoading: false });
     } catch (e: any) {
+      console.error("[createSession] Failed:", e.message);
       set({ isLoading: false });
       throw e;
     }
@@ -150,12 +215,18 @@ export const useInterviewStore = create<InterviewStore>((set, get) => ({
 
   startInterview: async () => {
     const { session } = get();
-    if (!session) return;
+    if (!session) {
+      console.error("[startInterview] No session found!");
+      return;
+    }
+    console.log("[startInterview] Starting interview for session:", session.session_id);
     set({ isLoading: true });
     try {
       const updated = await apiCall<any>(`${API_BASE}/${session.session_id}/start`, { method: "POST" });
+      console.log("[startInterview] Interview started, switching to interview screen");
       set({ session: updated, screen: "interview", isLoading: false });
     } catch (e: any) {
+      console.error("[startInterview] Failed:", e.message);
       set({ isLoading: false });
       throw e;
     }
@@ -164,15 +235,42 @@ export const useInterviewStore = create<InterviewStore>((set, get) => ({
   sendMessage: async (content) => {
     const { session } = get();
     if (!session) return;
-    set({ isLoading: true });
+
+    // ── Optimistic: show candidate message immediately ──
+    const optimisticTurn = {
+      role: "candidate" as const,
+      content,
+      phase: session.current_phase,
+      timestamp: new Date().toISOString(),
+    };
+    set({
+      session: { ...session, transcript: [...session.transcript, optimisticTurn] },
+      textInput: "",
+      isLoading: true, // loading = waiting for AI response
+    });
+
     try {
       const updated = await apiCall<any>(
         `${API_BASE}/${session.session_id}/send?content=${encodeURIComponent(content)}`,
         { method: "POST" },
       );
-      set({ session: updated, textInput: "", isLoading: false });
+      const records: AnswerRecord[] = updated.answer_records || [];
+      const lastRecord = records[records.length - 1];
+      set({
+        session: updated,
+        isLoading: false,
+        lastDraftScore: lastRecord?.draft_score ?? null,
+        lastFeedback: lastRecord?.notes || "",
+        showFeedback: true,
+      });
     } catch (e: any) {
-      set({ isLoading: false });
+      console.error("[sendMessage] Failed:", e.message);
+      // Roll back the optimistic update
+      set({
+        session: get().session ? { ...get().session!, transcript: session.transcript } : null,
+        isLoading: false,
+        textInput: content, // restore text so user can retry
+      });
       throw e;
     }
   },
@@ -184,8 +282,6 @@ export const useInterviewStore = create<InterviewStore>((set, get) => ({
         `${API_BASE}/${sessionId}/voice/send?text=${encodeURIComponent(text)}`,
         { method: "POST" },
       );
-
-      // Update transcript
       const { session } = get();
       if (session) {
         set({
@@ -210,6 +306,53 @@ export const useInterviewStore = create<InterviewStore>((set, get) => ({
       throw e;
     }
   },
+
+  pauseInterview: async () => {
+    const { session } = get();
+    if (!session) return;
+    try {
+      const data = await apiCall<any>(
+        `${API_BASE}/${session.session_id}/pause`,
+        { method: "POST" },
+      );
+      set({
+        session: { ...session, status: "paused", elapsed_seconds: data.elapsed_seconds },
+      });
+    } catch (e: any) {
+      throw e;
+    }
+  },
+
+  resumeInterview: async () => {
+    const { session } = get();
+    if (!session) return;
+    set({ isLoading: true });
+    try {
+      const updated = await apiCall<any>(
+        `${API_BASE}/${session.session_id}/resume`,
+        { method: "POST" },
+      );
+      set({ session: updated, isLoading: false });
+    } catch (e: any) {
+      set({ isLoading: false });
+      throw e;
+    }
+  },
+
+  fetchProgress: async () => {
+    const { session } = get();
+    if (!session) return;
+    try {
+      const progress = await apiCall<ProgressData>(
+        `${API_BASE}/${session.session_id}/progress`,
+      );
+      set({ progress });
+    } catch {
+      // Silently fail — progress is non-critical
+    }
+  },
+
+  dismissFeedback: () => set({ showFeedback: false }),
 
   finishInterview: async () => {
     const { session } = get();
